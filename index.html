@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hologram Viewer</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1f1f; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #7fffe6;
+            letter-spacing: .2em; font-size: 12px; text-transform: uppercase; pointer-events: none; transition: opacity .6s; }
+  #replay { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); padding: 9px 18px;
+            background: rgba(20,60,58,.45); color: #9ffff0; border: 1px solid rgba(80,255,225,.45);
+            border-radius: 999px; cursor: pointer; font-size: 12px; letter-spacing: .15em; text-transform: uppercase;
+            backdrop-filter: blur(6px); }
+  #replay:hover { background: rgba(40,120,115,.55); }
+</style>
+<!-- three.js loaded from a CDN. To work offline, download three and point these URLs at your local copy. -->
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="status">Loading model 0%</div>
+<button id="replay">Replay intro</button>
+
+<script type="module">
+import * as THREE from 'three';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ======================================================================
+   CONFIG  -  tweak everything here
+   ====================================================================== */
+const CONFIG = {
+  modelUrl: './model.fbx',      // path to your model
+  modelHeight: 2.2,             // model is scaled to this height (world units)
+  colorLight: '#46ffe0',        // hologram highlight colour
+  colorDeep:  '#0b7f78',        // hologram shadow colour
+  buildSeconds: 7,              // total time the hologram takes to build (bottom -> top)
+  pointCount: 45000,            // particles in the build effect
+  beamsPerSide: 650,            // spray lines per beam (2 beams: upper-left, upper-right)
+  beamInset: { x: 0.86, y: 0.72 }, // where the 2 beams start, as a fraction of the visible half-width / half-height
+  rainAfterBuild: 0.28,         // matrix letters once the model is built: 0 = gone, 0.28 = faint & frozen
+  bloom: { strength: 0.85, radius: 0.6, threshold: 0.42 },
+  autoRotate: false,
+  playIntroOnLoad: true,
+};
+
+/* ======================================================================
+   RENDERER / SCENE / CAMERA / POST
+   ====================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 1.3, 6.6);
+const target = new THREE.Vector3(0, CONFIG.modelHeight * 0.5, 0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(target);
+controls.enablePan = false;
+controls.enableDamping = true;
+controls.minDistance = 3; controls.maxDistance = 10;
+controls.maxPolarAngle = Math.PI * 0.56;
+controls.autoRotate = CONFIG.autoRotate; controls.autoRotateSpeed = 1.2;
+controls.update();
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight),
+  CONFIG.bloom.strength, CONFIG.bloom.radius, CONFIG.bloom.threshold);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+/* ======================================================================
+   BEAM SOURCES: two points in the upper corners of the view (re-placed on resize)
+   ====================================================================== */
+const anchorL = new THREE.Vector3(), anchorR = new THREE.Vector3();
+function placeAnchors() {
+  const dist = camera.position.distanceTo(target);
+  const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * dist;
+  const halfW = halfH * camera.aspect;
+  const y = target.y + halfH * CONFIG.beamInset.y;
+  const x = halfW * CONFIG.beamInset.x;
+  anchorL.set(-x, y, -0.8);
+  anchorR.set(x, y, -0.8);
+}
+placeAnchors();
+
+/* ======================================================================
+   MATRIX RAIN BACKGROUND
+   - drawn on a 2D canvas used as scene.background (so bloom makes it glow)
+   - real glyph trails: bright head, fading tail, glyphs that flicker/mutate
+   - 3 depth layers (far = small + dim, near = big + bright)
+   - rain.run() makes it fall, rain.freeze(a) stops it and dims it to alpha a
+   ====================================================================== */
+function createMatrixRain() {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const GLYPHS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$#@%&*+=<>?';
+  const rg = () => GLYPHS[(Math.random() * GLYPHS.length) | 0];
+  const rr = (a, b) => a + Math.random() * (b - a);
+
+  let W = 0, H = 0, last = 0, bg = null, dirty = true;
+  const state = { speed: 1, alpha: 1, tSpeed: 1, tAlpha: 1 };
+  let layers = [];
+
+  function spawn(col, rows, initial) {
+    const L = col.layer;
+    col.len = Math.round(rr(L.len[0], L.len[1]));
+    col.speed = rr(L.spd[0], L.spd[1]);
+    col.cell = initial ? Math.floor(rr(-col.len, rows)) : -Math.floor(rr(0, 18));
+    col.head = col.cell;
+    col.g = Array.from({ length: col.len }, rg);
+    col.m = Array.from({ length: col.len }, () => Math.random() < 0.3);
+  }
+
+  function resize(w, h) {
+    W = canvas.width = w; H = canvas.height = h;
+    bg = ctx.createRadialGradient(W / 2, H * 0.55, 0, W / 2, H * 0.55, Math.max(W, H) * 0.7);
+    bg.addColorStop(0, 'rgb(30,56,55)'); bg.addColorStop(1, 'rgb(9,20,20)');
+    const defs = [  // far -> near
+      { size: H / 55, a: 0.32, spd: [5, 9],   len: [8, 16],  density: 0.6 },
+      { size: H / 38, a: 0.62, spd: [8, 14],  len: [10, 22], density: 0.5 },
+      { size: H / 27, a: 1.0,  spd: [12, 20], len: [12, 26], density: 0.32 },
+    ];
+    layers = defs.map((d) => {
+      const size = Math.max(9, Math.round(d.size)), cellH = size * 1.2, rows = Math.ceil(H / cellH);
+      const layer = { ...d, size, cellH, rows, cols: [] };
+      const slots = Math.floor(W / (size * 1.25));
+      for (let s = 0; s < slots; s++) {
+        if (Math.random() > d.density) continue;
+        const col = { layer, x: (s + 0.5) * size * 1.25 + rr(-2, 2) };
+        spawn(col, rows, true);
+        layer.cols.push(col);
+      }
+      return layer;
+    });
+    dirty = true;
+  }
+
+  function draw() {
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (const L of layers) {
+      ctx.font = `bold ${L.size}px monospace`;
+      for (const c of L.cols) {
+        for (let k = 0; k < c.len; k++) {
+          const y = (c.cell - k) * L.cellH + L.cellH / 2;
+          if (y < -L.cellH || y > H + L.cellH) continue;
+          let a = k === 0 ? 1 : Math.pow(1 - k / c.len, 1.5) * 0.75;
+          a *= L.a * state.alpha;
+          if (a < 0.02) continue;
+          ctx.fillStyle = k === 0 ? `rgba(215,255,248,${a})` : `rgba(60,235,205,${a})`;
+          if (c.m[k]) { ctx.save(); ctx.translate(c.x, y); ctx.scale(-1, 1); ctx.fillText(c.g[k], 0, 0); ctx.restore(); }
+          else ctx.fillText(c.g[k], c.x, y);
+        }
+      }
+    }
+    tex.needsUpdate = true;
+  }
+
+  function update(now) {
+    if (now - last < 1000 / 30) return;
+    const dt = Math.min((now - last) / 1000, 0.1); last = now;
+    const k = 1 - Math.exp(-dt * 2.2);
+    state.speed += (state.tSpeed - state.speed) * k;
+    state.alpha += (state.tAlpha - state.alpha) * k;
+    if (state.tSpeed === 0 && state.speed < 0.01) state.speed = 0;
+    if (Math.abs(state.alpha - state.tAlpha) < 0.004) state.alpha = state.tAlpha;
+    const moving = state.speed > 0, fading = state.alpha !== state.tAlpha;
+    if (!moving && !fading && !dirty) return;        // frozen: no redraw needed
+    dirty = false;
+    if (moving) for (const L of layers) for (const c of L.cols) {
+      c.head += c.speed * state.speed * dt;
+      let steps = Math.min(Math.floor(c.head) - c.cell, 3);
+      while (steps-- > 0) { c.g.unshift(rg()); c.g.pop(); c.m.unshift(Math.random() < 0.3); c.m.pop(); }
+      c.cell = Math.floor(c.head);
+      for (let i = 1; i < c.len; i++) if (Math.random() < 0.012) c.g[i] = rg();
+      if (c.cell - c.len > L.rows + 1) spawn(c, L.rows, false);
+    }
+    draw();
+  }
+
+  return {
+    tex, resize, update,
+    run()            { state.tSpeed = 1; state.tAlpha = 1; },                       // fall + full brightness
+    freeze(a = 0.28) { state.tSpeed = 0; state.tAlpha = a; },                       // ease to a stop, dim
+    snapFreeze(a)    { state.tSpeed = state.speed = 0; state.tAlpha = state.alpha = a; dirty = true; },
+  };
+}
+const rain = createMatrixRain();
+rain.resize(innerWidth, innerHeight);
+scene.background = rain.tex;
+
+/* ======================================================================
+   HOLOGRAM MATERIAL  (fresnel rim + scanlines + sweeping band + reveal edge + flicker)
+   ====================================================================== */
+const HOLO_VERT = /* glsl */`
+    uniform float uTime;
+    varying vec3 vN; varying vec3 vV; varying vec3 vW; varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      // rare horizontal glitch slice
+      float g = step(0.992, sin(uTime * 1.7) * 0.5 + 0.5) * step(0.5, sin(wp.y * 9.0 + uTime * 25.0));
+      wp.x += g * 0.035;
+      vW = wp.xyz;
+      vN = normalize(normalMatrix * normal);
+      vec4 mv = viewMatrix * wp;
+      vV = normalize(-mv.xyz);
+      gl_Position = projectionMatrix * mv;
+    }`;
+
+const holoMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, side: THREE.FrontSide, blending: THREE.AdditiveBlending,
+  uniforms: {
+    uTime: { value: 0 }, uReveal: { value: -1 }, uOpacity: { value: 1 },
+    uMap: { value: null }, uHasMap: { value: 0 },
+    uLight: { value: new THREE.Color(CONFIG.colorLight) },
+    uDeep: { value: new THREE.Color(CONFIG.colorDeep) },
+    uHeight: { value: CONFIG.modelHeight },
+  },
+  vertexShader: HOLO_VERT,
+  fragmentShader: /* glsl */`
+    uniform float uTime, uReveal, uOpacity, uHasMap, uHeight;
+    uniform sampler2D uMap; uniform vec3 uLight, uDeep;
+    varying vec3 vN; varying vec3 vV; varying vec3 vW; varying vec2 vUv;
+    void main() {
+      if (vW.y > uReveal) discard;
+      vec3 n = normalize(vN), v = normalize(vV);
+      float fres = pow(1.0 - abs(dot(n, v)), 2.2);
+
+      vec3 tex = uHasMap > 0.5 ? texture2D(uMap, vUv).rgb : vec3(0.7);
+      float lum = dot(tex, vec3(0.299, 0.587, 0.114));
+      vec3 base = mix(uDeep, uLight, smoothstep(0.05, 0.85, lum));
+      base = mix(base, vec3(0.8, 1.0, 0.96), smoothstep(0.5, 1.0, lum) * 0.6);   // whites read as pale mint
+
+      float scan  = pow(0.5 + 0.5 * sin(vW.y * 150.0 - uTime * 2.2), 3.0);   // scrolling scanlines
+      float fine  = 0.88 + 0.12 * sin(vW.y * 700.0);
+      float sweepY = mod(uTime * 0.55, uHeight * 1.6) - uHeight * 0.1;
+      float band  = exp(-pow((vW.y - sweepY) * 10.0, 2.0));                    // bright sweeping band
+      float edge  = exp(-pow((vW.y - uReveal) * 35.0, 2.0));                   // build front
+      float flick = 0.93 + 0.07 * sin(uTime * 37.0) * sin(uTime * 11.0);
+
+      float a = (0.42 + fres * 0.95 + scan * 0.14 + band * 0.35) * flick * fine;
+      vec3 col = base * (1.0 + fres * 1.4) + vec3(0.6, 1.0, 0.92) * (band * 0.35 + edge * 1.2 + fres * 0.25);
+      gl_FragColor = vec4(col, (a + edge * 0.8) * uOpacity);
+    }`,
+});
+
+// depth-only twin: stops the additive layers piling up so the hologram stays translucent, not white
+const depthMat = new THREE.ShaderMaterial({
+  colorWrite: false, depthWrite: true,
+  uniforms: { uTime: holoMat.uniforms.uTime, uReveal: holoMat.uniforms.uReveal },
+  vertexShader: HOLO_VERT,
+  fragmentShader: `uniform float uReveal; varying vec3 vW; varying vec3 vN; varying vec3 vV; varying vec2 vUv;
+    void main(){ if (vW.y > uReveal) discard; gl_FragColor = vec4(0.0); }`,
+});
+
+/* ======================================================================
+   BUILD EFFECT: two sprays shoot particles from the upper corners onto the model.
+   Particles land bottom -> top, each spray line follows its particle, and the solid
+   hologram appears right behind the landing front.  (u = 0..1 build timeline)
+   ====================================================================== */
+const ANIM_GLSL = /* glsl */`
+  attribute vec3 aRand; attribute float aStart; attribute float aSide;
+  uniform float uU, uTime; uniform vec3 uAnchorL, uAnchorR;
+  const float FLIGHT = 0.2;                                   // flight time (fraction of the build)
+  float flightP() { return clamp((uU - aStart) / FLIGHT, 0.0, 1.0); }
+  vec3 animPos() {
+    float p = flightP();
+    vec3 anchor = aSide < 0.5 ? uAnchorL : uAnchorR;
+    float e = 1.0 - pow(1.0 - p, 2.2);                        // fast out of the nozzle, settles at the end
+    vec3 pos = mix(anchor, position, e);
+    pos += (aRand.yzx - 0.5) * 0.3 * sin(p * 3.14159);         // slight spray spread
+    pos += sin(uTime * 3.0 + aRand * 20.0) * 0.004 * step(1.0, p);   // shimmer once landed
+    return pos;
+  }`;
+
+let points = null, lines = null, pointUniforms = null;
+
+function buildIntro(sourceMeshes) {
+  const H = CONFIG.modelHeight;
+  const total = sourceMeshes.reduce((s, m) => s + m.geometry.attributes.position.count, 0);
+  const N = Math.min(CONFIG.pointCount, total);
+  const pos = new Float32Array(N * 3), rnd = new Float32Array(N * 3), start = new Float32Array(N), side = new Float32Array(N);
+  const v = new THREE.Vector3();
+  for (let i = 0; i < N; i++) {
+    let r = Math.random() * total, m = sourceMeshes[0];
+    for (const mm of sourceMeshes) { const c = mm.geometry.attributes.position.count; if (r < c) { m = mm; break; } r -= c; }
+    const idx = Math.min(Math.floor(r), m.geometry.attributes.position.count - 1);
+    v.fromBufferAttribute(m.geometry.attributes.position, idx).applyMatrix4(m.matrixWorld);
+    pos.set([v.x, v.y, v.z], i * 3);
+    rnd.set([Math.random(), Math.random(), Math.random()], i * 3);
+    start[i] = THREE.MathUtils.clamp(v.y / H, 0, 1) * 0.6 + Math.random() * 0.1;   // low parts first
+    side[i] = Math.random() < 0.5 ? 0 : 1;
+  }
+
+  pointUniforms = {
+    uU: { value: 0 }, uTime: { value: 0 }, uReveal: holoMat.uniforms.uReveal,
+    uAnchorL: { value: anchorL }, uAnchorR: { value: anchorR },
+    uSize: { value: 5 }, uPR: { value: renderer.getPixelRatio() },
+  };
+
+  // --- particles
+  const pg = new THREE.BufferGeometry();
+  pg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  pg.setAttribute('aRand', new THREE.BufferAttribute(rnd, 3));
+  pg.setAttribute('aStart', new THREE.BufferAttribute(start, 1));
+  pg.setAttribute('aSide', new THREE.BufferAttribute(side, 1));
+  points = new THREE.Points(pg, new THREE.ShaderMaterial({
+    uniforms: pointUniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: ANIM_GLSL + /* glsl */`
+      uniform float uSize, uPR, uReveal; varying float vA;
+      void main() {
+        float p = flightP();
+        vec4 mv = modelViewMatrix * vec4(animPos(), 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = uSize * uPR * (4.0 / -mv.z) * (0.6 + aRand.x * 0.8);
+        float settle = smoothstep(-0.05, 0.3, uReveal - position.y);   // solid surface covers the dust
+        vA = (0.4 + aRand.y * 0.6) * smoothstep(0.0, 0.08, p) * mix(1.0, 0.04, settle);
+      }`,
+    fragmentShader: /* glsl */`
+      varying float vA;
+      void main() {
+        float d = length(gl_PointCoord - 0.5);
+        if (d > 0.5) discard;
+        gl_FragColor = vec4(vec3(0.3, 1.0, 0.85) * 0.9, smoothstep(0.5, 0.0, d) * vA * 0.55);
+      }`,
+  }));
+  points.frustumCulled = false;
+  scene.add(points);
+
+  // --- spray lines: nozzle -> flying particle (line grows, then fades as the particle lands)
+  const L = CONFIG.beamsPerSide * 2;
+  const lp = new Float32Array(L * 6), lr = new Float32Array(L * 6), ls = new Float32Array(L * 2),
+        lsd = new Float32Array(L * 2), le = new Float32Array(L * 2);
+  for (let i = 0; i < L; i++) {
+    const s = (Math.random() * N) | 0, sd = i % 2;
+    for (let k = 0; k < 2; k++) {
+      lp.set([pos[s*3], pos[s*3+1], pos[s*3+2]], i * 6 + k * 3);
+      lr.set([rnd[s*3], rnd[s*3+1], rnd[s*3+2]], i * 6 + k * 3);
+      ls[i * 2 + k] = start[s]; lsd[i * 2 + k] = sd; le[i * 2 + k] = k;
+    }
+  }
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.BufferAttribute(lp, 3));
+  lg.setAttribute('aRand', new THREE.BufferAttribute(lr, 3));
+  lg.setAttribute('aStart', new THREE.BufferAttribute(ls, 1));
+  lg.setAttribute('aSide', new THREE.BufferAttribute(lsd, 1));
+  lg.setAttribute('aEnd', new THREE.BufferAttribute(le, 1));
+  lines = new THREE.LineSegments(lg, new THREE.ShaderMaterial({
+    uniforms: pointUniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: ANIM_GLSL + /* glsl */`
+      attribute float aEnd; varying float vA;
+      void main() {
+        float p = flightP();
+        vec3 anchor = aSide < 0.5 ? uAnchorL : uAnchorR;
+        vec3 pt = aEnd > 0.5 ? animPos() : anchor;
+        float vis = smoothstep(0.0, 0.05, p) * (1.0 - smoothstep(0.6, 0.95, p));
+        vA = mix(0.45, 1.0, aEnd) * vis;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(pt, 1.0);
+      }`,
+    fragmentShader: /* glsl */`
+      varying float vA;
+      void main() { gl_FragColor = vec4(vec3(0.3, 1.0, 0.85), 0.075 * vA); }`,
+  }));
+  lines.frustumCulled = false;
+  scene.add(lines);
+}
+
+/* ======================================================================
+   BASE PLATE (soft glow + ring under the model)
+   ====================================================================== */
+function buildBase(radius) {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d'), gr = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  gr.addColorStop(0, 'rgba(90,255,230,0.55)'); gr.addColorStop(0.5, 'rgba(40,200,180,0.18)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const glow = new THREE.Mesh(new THREE.PlaneGeometry(radius * 4, radius * 4),
+    new THREE.MeshBasicMaterial({ map: t, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+  glow.rotation.x = -Math.PI / 2; glow.position.y = 0.005;
+  const ring = new THREE.Mesh(new THREE.RingGeometry(radius * 1.05, radius * 1.12, 96),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(CONFIG.colorLight).multiplyScalar(1.4), transparent: true,
+      opacity: 0.8, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; ring.position.y = 0.006;
+  const grp = new THREE.Group(); grp.add(glow, ring); scene.add(grp);
+  return grp;
+}
+
+/* ======================================================================
+   LOAD MODEL
+   ====================================================================== */
+const statusEl = document.getElementById('status');
+let model = null, mixer = null, baseGroup = null;
+
+new FBXLoader().load(CONFIG.modelUrl, (obj) => {
+  // normalise: scale to CONFIG.modelHeight, feet on y=0, centred on x/z
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  obj.scale.multiplyScalar(CONFIG.modelHeight / size.y);
+  obj.updateMatrixWorld(true);
+  const b2 = new THREE.Box3().setFromObject(obj), c2 = b2.getCenter(new THREE.Vector3());
+  obj.position.set(obj.position.x - c2.x, obj.position.y - b2.min.y, obj.position.z - c2.z);
+  obj.updateMatrixWorld(true);
+
+  const meshes = [], found = [];
+  obj.traverse((o) => { if (o.isMesh) found.push(o); });   // collect first: we add children below
+  found.forEach((o) => {
+    const m = Array.isArray(o.material) ? o.material[0] : o.material;
+    if (m && m.map && !holoMat.uniforms.uMap.value) {
+      m.map.colorSpace = THREE.SRGBColorSpace;
+      holoMat.uniforms.uMap.value = m.map; holoMat.uniforms.uHasMap.value = 1;
+    }
+    o.material = holoMat; o.frustumCulled = false; o.renderOrder = 2;
+    const pre = new THREE.Mesh(o.geometry, depthMat);       // depth pre-pass twin
+    pre.frustumCulled = false; pre.renderOrder = 0; pre.matrixAutoUpdate = false;
+    o.add(pre);
+    meshes.push(o);
+  });
+  scene.add(obj); model = obj;
+
+  // if the FBX has an animation (e.g. a wave) play it. NOTE: skinned meshes need the
+  // material to support skinning; this file is a static mesh so it is not used here.
+  if (obj.animations && obj.animations.length) {
+    mixer = new THREE.AnimationMixer(obj);
+    mixer.clipAction(obj.animations[0]).play();
+  }
+
+  const footprint = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3());
+  baseGroup = buildBase(Math.max(footprint.x, footprint.z) * 0.6);
+  buildIntro(meshes);
+
+  statusEl.style.opacity = 0;
+  if (CONFIG.playIntroOnLoad) replay(); else skipIntro();
+}, (e) => {
+  if (e.lengthComputable) statusEl.textContent = `Loading model ${Math.round(e.loaded / e.total * 100)}%`;
+}, (err) => { statusEl.textContent = 'Could not load ' + CONFIG.modelUrl; console.error(err); });
+
+/* ======================================================================
+   TIMELINE
+   ====================================================================== */
+let t0 = 0, playing = false, builtDone = false;
+const ease = (x) => x * x * (3 - 2 * x);
+
+function replay() {                       // rain falls again while the hologram builds
+  t0 = performance.now() / 1000; playing = true; builtDone = false;
+  rain.run();
+}
+function skipIntro() {                    // jump straight to the finished hologram
+  t0 = performance.now() / 1000 - CONFIG.buildSeconds - 1; playing = true; builtDone = true;
+  rain.snapFreeze(CONFIG.rainAfterBuild);
+}
+document.getElementById('replay').onclick = replay;
+addEventListener('keydown', (e) => { if (e.key === 'r' || e.key === 'R') replay(); });
+window.hologram = { replay, skipIntro, CONFIG };   // call window.hologram.replay() from your own code
+
+/* ======================================================================
+   LOOP
+   ====================================================================== */
+const clock = new THREE.Clock();
+function frame(nowMs) {
+  requestAnimationFrame(frame);
+  const dt = clock.getDelta(), time = nowMs / 1000;
+  rain.update(nowMs);
+  holoMat.uniforms.uTime.value = time;
+  if (mixer) mixer.update(dt);
+
+  if (model && playing) {
+    const u = Math.min((time - t0) / CONFIG.buildSeconds, 1);
+    const rv = Math.min(Math.max((u - 0.3) / 0.62, 0), 1);          // solid hologram front (0..1 up the body)
+    pointUniforms.uU.value = u;
+    pointUniforms.uTime.value = time;
+    holoMat.uniforms.uReveal.value = -0.1 + rv * (CONFIG.modelHeight * 1.06);
+    holoMat.uniforms.uOpacity.value = 0.45 + 0.55 * ease(rv);
+    lines.visible = points.visible = u < 1;
+    if (u >= 1 && !builtDone) { builtDone = true; rain.freeze(CONFIG.rainAfterBuild); }   // build finished: letters stop
+  }
+  controls.update();
+  composer.render();
+}
+requestAnimationFrame(frame);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
+  rain.resize(innerWidth, innerHeight);
+  placeAnchors();
+});
+</script>
+</body>
+</html>
